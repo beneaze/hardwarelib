@@ -102,6 +102,15 @@ class RigolDHO4000(Oscilloscope):
             f"Scope single acquisition timed out; last trigger status was {last_status!r}"
         )
 
+    def get_timebase(self) -> float:
+        return float(self.query(":TIMebase:MAIN:SCALe?"))
+
+    def set_timebase(self, scale_s_per_div: float) -> None:
+        self.write(f":TIMebase:MAIN:SCALe {scale_s_per_div:.6E}")
+
+    def set_trigger_mode(self, mode: str = "AUTO") -> None:
+        self.write(f":TRIGger:SWEep {mode}")
+
     def read_waveform(
         self, channel: int
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
