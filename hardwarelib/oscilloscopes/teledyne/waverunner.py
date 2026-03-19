@@ -128,6 +128,22 @@ class LeCroyWaveRunner(Oscilloscope):
         self._rm = pyvisa.ResourceManager()
         self._inst = self._rm.open_resource(self.resource_name)
         self._inst.timeout = self.timeout_ms
+
+        # LeCroy over USBTMC doesn't reliably use \n termination on
+        # responses, so we must avoid read() blocking on a termchar
+        # that never arrives.  Disable termchar-based reads and use
+        # read_raw() everywhere instead (see query()).
+        self._inst.read_termination = None
+        self._inst.write_termination = "\n"
+
+        if hasattr(self._inst, "chunk_size"):
+            self._inst.chunk_size = 1024 * 1024
+
+        try:
+            self._inst.clear()
+        except Exception:
+            pass
+
         self.write("CHDR OFF")
         self.write("CORD HI")
         self.write("COMM_FORMAT DEF9,WORD,BIN")
@@ -153,8 +169,8 @@ class LeCroyWaveRunner(Oscilloscope):
         if self._inst is None:
             raise RuntimeError("Scope not open.")
         self.write(cmd)
-        resp = self._inst.read()
-        return resp.strip()
+        raw = self._inst.read_raw()
+        return raw.decode("ascii", errors="replace").strip()
 
     def flush(self) -> None:
         """Clear VISA I/O buffers and reset the scope's status."""
