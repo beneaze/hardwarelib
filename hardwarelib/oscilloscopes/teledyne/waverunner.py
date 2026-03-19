@@ -221,7 +221,18 @@ class LeCroyWaveRunner(Oscilloscope):
     def acquire_single_and_wait(
         self, timeout_s: float, settle_s: float = 0.0
     ) -> None:
+        # Stop any ongoing acquisition so the scope isn't sitting on
+        # stale data (e.g. an AUTO-mode capture of an RF turn-on transient).
+        self.write("TRMD STOP")
+        self.query("*OPC?")
+
+        # Drain the Internal-state-change Register so that the next
+        # INR poll reliably reflects a *new* acquisition, not an old one.
+        self.query("INR?")
+
+        # Arm for a single trigger.
         self.write("TRMD SINGLE")
+
         t0 = time.time()
         last_status = ""
         while time.time() - t0 < timeout_s:
