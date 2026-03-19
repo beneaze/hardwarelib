@@ -20,67 +20,94 @@ import pyvisa
 from hardwarelib.base import Oscilloscope
 
 # ---------------------------------------------------------------------------
-# WAVEDESC binary header layout (LECROY_2_3 template, big-endian)
+# WAVEDESC binary header layout (LECROY_2_3 template)
+# Byte order is auto-detected at parse time from the header itself.
 # ---------------------------------------------------------------------------
 
 _WAVEDESC_FIELDS: list[dict] = [
     {"offset": 0,   "name": "DESCRIPTOR_NAME",  "fmt": "16s"},
     {"offset": 16,  "name": "TEMPLATE_NAME",    "fmt": "16s"},
-    {"offset": 32,  "name": "COMM_TYPE",         "fmt": ">h"},   # 0=byte, 1=word
-    {"offset": 34,  "name": "COMM_ORDER",        "fmt": ">h"},   # 0=HiFirst, 1=LoFirst
-    {"offset": 36,  "name": "WAVE_DESCRIPTOR",   "fmt": ">i"},
-    {"offset": 40,  "name": "USER_TEXT",          "fmt": ">i"},
-    {"offset": 44,  "name": "RES_DESC1",          "fmt": ">i"},
-    {"offset": 48,  "name": "TRIGTIME_ARRAY",     "fmt": ">i"},
-    {"offset": 52,  "name": "RIS_TIME_ARRAY",     "fmt": ">i"},
-    {"offset": 56,  "name": "RES_ARRAY1",         "fmt": ">i"},
-    {"offset": 60,  "name": "WAVE_ARRAY_1",       "fmt": ">i"},
-    {"offset": 64,  "name": "WAVE_ARRAY_2",       "fmt": ">i"},
+    {"offset": 32,  "name": "COMM_TYPE",         "fmt": "h"},    # 0=byte, 1=word
+    {"offset": 34,  "name": "COMM_ORDER",        "fmt": "h"},    # 0=HiFirst, 1=LoFirst
+    {"offset": 36,  "name": "WAVE_DESCRIPTOR",   "fmt": "i"},
+    {"offset": 40,  "name": "USER_TEXT",          "fmt": "i"},
+    {"offset": 44,  "name": "RES_DESC1",          "fmt": "i"},
+    {"offset": 48,  "name": "TRIGTIME_ARRAY",     "fmt": "i"},
+    {"offset": 52,  "name": "RIS_TIME_ARRAY",     "fmt": "i"},
+    {"offset": 56,  "name": "RES_ARRAY1",         "fmt": "i"},
+    {"offset": 60,  "name": "WAVE_ARRAY_1",       "fmt": "i"},
+    {"offset": 64,  "name": "WAVE_ARRAY_2",       "fmt": "i"},
     {"offset": 76,  "name": "INSTRUMENT_NAME",   "fmt": "16s"},
-    {"offset": 92,  "name": "INSTRUMENT_NUMBER", "fmt": ">I"},
+    {"offset": 92,  "name": "INSTRUMENT_NUMBER", "fmt": "I"},
     {"offset": 96,  "name": "TRACE_LABEL",       "fmt": "16s"},
-    {"offset": 116, "name": "WAVE_ARRAY_COUNT",  "fmt": ">i"},
-    {"offset": 120, "name": "PNTS_PER_SCREEN",   "fmt": ">i"},
-    {"offset": 124, "name": "FIRST_VALID_PNT",   "fmt": ">i"},
-    {"offset": 128, "name": "LAST_VALID_PNT",    "fmt": ">i"},
-    {"offset": 132, "name": "FIRST_POINT",        "fmt": ">i"},
-    {"offset": 136, "name": "SPARSING_FACTOR",    "fmt": ">i"},
-    {"offset": 140, "name": "SEGMENT_INDEX",      "fmt": ">i"},
-    {"offset": 144, "name": "SUBARRAY_COUNT",     "fmt": ">i"},
-    {"offset": 148, "name": "SWEEPS_PER_ACQ",     "fmt": ">i"},
-    {"offset": 156, "name": "VERTICAL_GAIN",      "fmt": ">f"},
-    {"offset": 160, "name": "VERTICAL_OFFSET",    "fmt": ">f"},
-    {"offset": 164, "name": "MAX_VALUE",           "fmt": ">f"},
-    {"offset": 168, "name": "MIN_VALUE",           "fmt": ">f"},
-    {"offset": 172, "name": "NOMINAL_BITS",       "fmt": ">h"},
-    {"offset": 176, "name": "HORIZ_INTERVAL",     "fmt": ">f"},
-    {"offset": 180, "name": "HORIZ_OFFSET",       "fmt": ">d"},
-    {"offset": 188, "name": "PIXEL_OFFSET",       "fmt": ">d"},
+    {"offset": 116, "name": "WAVE_ARRAY_COUNT",  "fmt": "i"},
+    {"offset": 120, "name": "PNTS_PER_SCREEN",   "fmt": "i"},
+    {"offset": 124, "name": "FIRST_VALID_PNT",   "fmt": "i"},
+    {"offset": 128, "name": "LAST_VALID_PNT",    "fmt": "i"},
+    {"offset": 132, "name": "FIRST_POINT",        "fmt": "i"},
+    {"offset": 136, "name": "SPARSING_FACTOR",    "fmt": "i"},
+    {"offset": 140, "name": "SEGMENT_INDEX",      "fmt": "i"},
+    {"offset": 144, "name": "SUBARRAY_COUNT",     "fmt": "i"},
+    {"offset": 148, "name": "SWEEPS_PER_ACQ",     "fmt": "i"},
+    {"offset": 156, "name": "VERTICAL_GAIN",      "fmt": "f"},
+    {"offset": 160, "name": "VERTICAL_OFFSET",    "fmt": "f"},
+    {"offset": 164, "name": "MAX_VALUE",           "fmt": "f"},
+    {"offset": 168, "name": "MIN_VALUE",           "fmt": "f"},
+    {"offset": 172, "name": "NOMINAL_BITS",       "fmt": "h"},
+    {"offset": 176, "name": "HORIZ_INTERVAL",     "fmt": "f"},
+    {"offset": 180, "name": "HORIZ_OFFSET",       "fmt": "d"},
+    {"offset": 188, "name": "PIXEL_OFFSET",       "fmt": "d"},
     {"offset": 196, "name": "VERTUNIT",           "fmt": "48s"},
     {"offset": 244, "name": "HORUNIT",            "fmt": "48s"},
-    {"offset": 292, "name": "HORIZ_UNCERTAINTY",  "fmt": ">f"},
-    {"offset": 312, "name": "ACQ_DURATION",       "fmt": ">f"},
-    {"offset": 316, "name": "RECORD_TYPE",        "fmt": ">h"},
-    {"offset": 324, "name": "TIMEBASE",           "fmt": ">h"},
-    {"offset": 326, "name": "VERT_COUPLING",      "fmt": ">h"},
-    {"offset": 328, "name": "PROBE_ATT",          "fmt": ">f"},
-    {"offset": 344, "name": "WAVE_SOURCE",        "fmt": ">h"},
+    {"offset": 292, "name": "HORIZ_UNCERTAINTY",  "fmt": "f"},
+    {"offset": 312, "name": "ACQ_DURATION",       "fmt": "f"},
+    {"offset": 316, "name": "RECORD_TYPE",        "fmt": "h"},
+    {"offset": 324, "name": "TIMEBASE",           "fmt": "h"},
+    {"offset": 326, "name": "VERT_COUPLING",      "fmt": "h"},
+    {"offset": 328, "name": "PROBE_ATT",          "fmt": "f"},
+    {"offset": 344, "name": "WAVE_SOURCE",        "fmt": "h"},
 ]
 
 
-def _parse_wavedesc(buf: bytes) -> Dict:
-    """Parse a WAVEDESC binary block into a dict of typed values."""
+def _detect_endian(buf: bytes) -> str:
+    """Auto-detect byte order from the WAVEDESC block.
+
+    The WAVE_DESCRIPTOR length at offset 36 should be a reasonable
+    value (typically 346).  We read it in both endiannesses and pick
+    the one that makes sense.
+    """
+    if len(buf) < 40:
+        return ">"
+    len_be = struct.unpack_from(">i", buf, 36)[0]
+    len_le = struct.unpack_from("<i", buf, 36)[0]
+    if 100 < len_be < 100_000:
+        return ">"
+    if 100 < len_le < 100_000:
+        return "<"
+    return ">"
+
+
+def _parse_wavedesc(buf: bytes) -> tuple[Dict, str]:
+    """Parse a WAVEDESC binary block into a dict of typed values.
+
+    Returns ``(descriptor_dict, endian_prefix)`` where *endian_prefix*
+    is ``">"`` (big) or ``"<"`` (little).
+    """
+    endian = _detect_endian(buf)
     desc: Dict = {}
     for field in _WAVEDESC_FIELDS:
-        size = struct.calcsize(field["fmt"])
+        fmt = field["fmt"]
+        if fmt[-1] != "s":
+            fmt = endian + fmt
+        size = struct.calcsize(fmt)
         raw = buf[field["offset"] : field["offset"] + size]
         if len(raw) < size:
             continue
-        (val,) = struct.unpack(field["fmt"], raw)
+        (val,) = struct.unpack(fmt, raw)
         if isinstance(val, bytes):
             val = val.split(b"\x00", 1)[0].decode("ascii", errors="replace")
         desc[field["name"]] = val
-    return desc
+    return desc, endian
 
 
 def _find_block_start(raw: bytes) -> int:
@@ -147,6 +174,7 @@ class LeCroyWaveRunner(Oscilloscope):
         self.write("CHDR OFF")
         self.write("CORD HI")
         self.write("COMM_FORMAT DEF9,WORD,BIN")
+        self.query("*OPC?")
 
     def close(self) -> None:
         try:
@@ -214,6 +242,7 @@ class LeCroyWaveRunner(Oscilloscope):
 
     def set_timebase(self, scale_s_per_div: float) -> None:
         self.write(f"TDIV {scale_s_per_div:.6E}")
+        self.query("*OPC?")
 
     def set_trigger_mode(self, mode: str = "AUTO") -> None:
         mapping = {
@@ -233,9 +262,6 @@ class LeCroyWaveRunner(Oscilloscope):
             raise ValueError("Scope channel must be 1..4")
 
         self.write("TRMD STOP")
-        self.write("CHDR OFF")
-        self.write("CORD HI")
-        self.write("COMM_FORMAT DEF9,WORD,BIN")
         self.write(f"C{channel}:WF?")
         time.sleep(0.1)
 
@@ -243,7 +269,7 @@ class LeCroyWaveRunner(Oscilloscope):
 
         payload = _strip_block_header(raw)
 
-        desc = _parse_wavedesc(payload)
+        desc, endian = _parse_wavedesc(payload)
 
         wave_desc_len = desc["WAVE_DESCRIPTOR"]
         user_text_len = desc.get("USER_TEXT", 0)
@@ -258,7 +284,8 @@ class LeCroyWaveRunner(Oscilloscope):
         if comm_type == 0:
             adc = np.frombuffer(data_bytes, dtype=np.int8).astype(np.float64)
         else:
-            adc = np.frombuffer(data_bytes, dtype=">i2").astype(np.float64)
+            dt = ">i2" if endian == ">" else "<i2"
+            adc = np.frombuffer(data_bytes, dtype=dt).astype(np.float64)
 
         vgain = desc["VERTICAL_GAIN"]
         voff = desc["VERTICAL_OFFSET"]
@@ -278,5 +305,6 @@ class LeCroyWaveRunner(Oscilloscope):
             "nominal_bits": float(desc.get("NOMINAL_BITS", 0)),
             "probe_att": float(desc.get("PROBE_ATT", 1.0)),
             "comm_type": float(comm_type),
+            "endian": 0.0 if endian == ">" else 1.0,
         }
         return t_s, y_v, meta
