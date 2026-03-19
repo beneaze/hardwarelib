@@ -79,6 +79,19 @@ class RigolDHO4000(Oscilloscope):
         raw = self._inst.read_raw()
         return _parse_tmc_block(raw)
 
+    def flush(self) -> None:
+        """Clear the VISA I/O buffers and reset the scope's status."""
+        if self._inst is None:
+            return
+        try:
+            self._inst.clear()
+        except Exception:
+            pass
+        try:
+            self.write("*CLS")
+        except Exception:
+            pass
+
     # -- Oscilloscope interface ------------------------------------------------
 
     def idn(self) -> str:
