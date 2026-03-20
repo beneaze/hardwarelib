@@ -2,10 +2,16 @@
 
 Tested on the RSA3030E (9 kHz – 3 GHz).  Should work with other RSA3000E
 variants (RSA3015E, -TG models) without modification.
+
+NOTE: Rigol SAs do NOT properly implement ``*OPC?`` for sweep synchronisation.
+The query returns "1" immediately regardless of sweep progress.  This driver
+works around the issue by querying the expected sweep time and sleeping for
+that duration, then verifying the trace data actually updated.
 """
 
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Optional, Tuple
 
@@ -35,6 +41,7 @@ class RigolRSA3000E(SpectrumAnalyzer):
         self.timeout_ms = timeout_ms
         self._rm: Optional[pyvisa.ResourceManager] = None
         self._inst = None
+        self._last_trace_hash: Optional[bytes] = None
 
     # -- Instrument lifecycle --------------------------------------------------
 
@@ -82,10 +89,10 @@ class RigolRSA3000E(SpectrumAnalyzer):
     def reset(self) -> None:
         self.write("*RST")
         self.write("*CLS")
-        self._opc_wait(timeout_s=10.0)
+        time.sleep(5.0)
 
     def _opc_wait(self, timeout_s: float = 10.0) -> None:
-        """Block until all pending operations complete (``*OPC?``)."""
+        """Send ``*OPC?`` — unreliable on Rigol, kept for compatibility only."""
         saved = self._inst.timeout
         self._inst.timeout = int(timeout_s * 1000)
         try:
@@ -154,12 +161,33 @@ class RigolRSA3000E(SpectrumAnalyzer):
     def set_continuous_sweep(self, enabled: bool) -> None:
         self.write(f":INITiate:CONTinuous {'ON' if enabled else 'OFF'}")
 
-    def trigger_single_sweep(self, timeout_s: float = 10.0) -> None:
+    def get_sweep_time(self) -> float:
+        """Return the current sweep time in seconds."""
+        return float(self.query(":SENSe:SWEep:TIME?"))
+
+    def trigger_single_sweep(self, timeout_s: float = 30.0) -> None:
+        """Start a single sweep and block until it completes.
+
+        Rigol SAs do not honour ``*OPC?`` for sweep synchronisation, so
+        we query the expected sweep time and sleep for that duration plus
+        a safety margin, then confirm via ``*OPC?`` as a belt-and-suspenders.
+        """
+        self.write(":TRACe1:MODE WRITe")
         self.write(":INITiate:CONTinuous OFF")
         self.write(":ABORt")
-        time.sleep(0.05)
+        time.sleep(0.1)
+
+        sweep_time_s = self.get_sweep_time()
+
+        self.write("*CLS")
         self.write(":INITiate:IMMediate")
-        self._opc_wait(timeout_s=timeout_s)
+
+        time.sleep(sweep_time_s * 1.2 + 0.5)
+
+        try:
+            self._opc_wait(timeout_s=timeout_s)
+        except Exception:
+            time.sleep(0.5)
 
     def set_sweep_points(self, n_points: int) -> None:
         self.write(f":SENSe:SWEep:POINts {n_points}")
@@ -215,6 +243,32 @@ class RigolRSA3000E(SpectrumAnalyzer):
         frequencies = np.linspace(start, stop, len(amplitudes))
         return frequencies, amplitudes
 
+    def read_trace_fresh(
+        self,
+        trace: int = 1,
+        max_retries: int = 3,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Trigger a sweep and read trace, retrying if data looks stale.
+
+        Compares an MD5 hash of the amplitude array against the previous
+        read.  If identical (sweep didn't update the buffer), re-triggers
+        up to *max_retries* times with progressively longer waits.
+        """
+        for attempt in range(max_retries):
+            self.trigger_single_sweep()
+            freqs, amps = self.read_trace(trace)
+
+            data_hash = hashlib.md5(amps.tobytes()).digest()
+            if data_hash != self._last_trace_hash:
+                self._last_trace_hash = data_hash
+                return freqs, amps
+
+            extra_wait = 0.5 * (attempt + 1)
+            time.sleep(extra_wait)
+
+        self._last_trace_hash = data_hash
+        return freqs, amps
+
     # -- Convenience -----------------------------------------------------------
 
     def configure_for_single_tone(
@@ -225,11 +279,7 @@ class RigolRSA3000E(SpectrumAnalyzer):
         vbw_hz: Optional[float] = None,
         ref_level_dbm: float = 10.0,
     ) -> None:
-        """One-shot setup for measuring a single tone at *center_hz*.
-
-        Sets center / span, optionally RBW / VBW, reference level,
-        then runs a single sweep so the marker can be placed.
-        """
+        """One-shot setup for measuring a single tone at *center_hz*."""
         self.set_center_frequency(center_hz)
         self.set_span(span_hz)
         if rbw_hz is not None:
@@ -264,7 +314,6 @@ class RigolRSA3000E(SpectrumAnalyzer):
         if settle_s > 0:
             time.sleep(settle_s)
         self.trigger_single_sweep()
-        time.sleep(0.05)
         self.marker_peak_search(marker=1)
         return self.read_marker(marker=1)
 
@@ -281,8 +330,8 @@ class RigolRSA3000E(SpectrumAnalyzer):
 
         Takes a wideband sweep covering all harmonics, then extracts the
         peak power near each expected harmonic frequency from the trace
-        data.  This avoids the race condition of rapidly reconfiguring
-        center/span for each tone individually.
+        data.  Uses :meth:`read_trace_fresh` which retries if the SA
+        returns stale data from the previous sweep.
 
         Parameters
         ----------
@@ -321,6 +370,7 @@ class RigolRSA3000E(SpectrumAnalyzer):
         min_points = max(int(span / (per_tone_span_hz * 0.25)) + 1, 801)
         min_points = min(min_points, 10001)
         self.set_sweep_points(min_points)
+        self.set_sweep_time_auto()
 
         if rbw_hz is not None:
             self.set_rbw(rbw_hz)
@@ -328,10 +378,9 @@ class RigolRSA3000E(SpectrumAnalyzer):
             self.set_rbw_auto()
         self.set_vbw_auto()
         self.set_reference_level(ref_level_dbm)
-        time.sleep(max(settle_s, 0.05))
-        self.trigger_single_sweep()
-        time.sleep(0.05)
-        wb_freqs, wb_amps = self.read_trace(trace=1)
+        time.sleep(max(settle_s, 0.1))
+
+        wb_freqs, wb_amps = self.read_trace_fresh(trace=1)
 
         point_spacing = span / max(len(wb_amps) - 1, 1)
         half_search = max(per_tone_span_hz / 2.0, point_spacing * 2.0)
