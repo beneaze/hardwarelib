@@ -258,13 +258,20 @@ class RigolRSA3000E(SpectrumAnalyzer):
     # -- Clipping / overload detection -----------------------------------------
 
     def is_input_overloaded(self) -> bool:
-        """Query the questionable-power status register for an overload condition.
+        """Check whether an overload occurred during the last sweep.
 
-        Bit 3 (value 8) of ``:STATus:QUEStionable:CONDition?`` signals an
-        IF / ADC overload on the RSA3000E.  Returns ``True`` when the
-        instrument reports overload.
+        Reads the **event** register (``:STATus:QUEStionable:EVENt?``),
+        which **latches** any overload that happened since the last
+        ``*CLS``.  ``trigger_single_sweep`` sends ``*CLS`` right before
+        starting the sweep, so after the sweep this register reliably
+        reports whether the mixer overloaded at any point during that
+        sweep — even if the condition has since cleared.
+
+        Bit 3 (value 8) = IF / ADC overload on the RSA3000E.
+
+        Note: reading the event register clears it automatically.
         """
-        raw = int(self.query(":STATus:QUEStionable:CONDition?"))
+        raw = int(self.query(":STATus:QUEStionable:EVENt?"))
         return bool(raw & 0x08)
 
     def check_clipping(
