@@ -12,11 +12,14 @@ that duration, then verifying the trace data actually updated.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from typing import Optional, Tuple
 
 import numpy as np
 import pyvisa
+
+log = logging.getLogger(__name__)
 
 from hardwarelib.base import SpectrumAnalyzer
 
@@ -431,11 +434,17 @@ class RigolRSA3000E(SpectrumAnalyzer):
         rbw_hz: Optional[float] = None,
         ref_level_dbm: float = 10.0,
         settle_s: float = 0.1,
+        max_overload_retries: int = 3,
+        atten_step_db: float = 10.0,
     ) -> Tuple[float, float]:
         """Measure the peak power near *freq_hz*.
 
         Configures center/span, runs a single sweep, does a peak search,
         and returns ``(measured_freq_hz, power_dbm)``.
+
+        If the SA reports an input overload after a sweep, the internal
+        attenuation is raised by *atten_step_db* and the measurement is
+        repeated, up to *max_overload_retries* times.
         """
         self.configure_for_single_tone(
             center_hz=freq_hz,
@@ -445,7 +454,21 @@ class RigolRSA3000E(SpectrumAnalyzer):
         )
         if settle_s > 0:
             time.sleep(settle_s)
-        self.trigger_single_sweep()
+
+        for attempt in range(max_overload_retries + 1):
+            self.trigger_single_sweep()
+            if not self.is_input_overloaded():
+                break
+            current = self.get_input_attenuation()
+            new_atten = current + atten_step_db
+            log.warning(
+                "SA input overload detected (attempt %d/%d). "
+                "Increasing attenuation %g -> %g dB and re-sweeping.",
+                attempt + 1, max_overload_retries, current, new_atten,
+            )
+            self.set_input_attenuation(new_atten)
+            time.sleep(settle_s or 0.15)
+
         self.marker_peak_search(marker=1)
         return self.read_marker(marker=1)
 
@@ -457,6 +480,8 @@ class RigolRSA3000E(SpectrumAnalyzer):
         rbw_hz: Optional[float] = None,
         ref_level_dbm: float = 10.0,
         settle_s: float = 0.1,
+        max_overload_retries: int = 3,
+        atten_step_db: float = 10.0,
     ) -> dict:
         """Measure the fundamental and its harmonics from a wideband sweep.
 
@@ -464,6 +489,10 @@ class RigolRSA3000E(SpectrumAnalyzer):
         peak power near each expected harmonic frequency from the trace
         data.  Uses :meth:`read_trace_fresh` which retries if the SA
         returns stale data from the previous sweep.
+
+        If the SA reports an input overload after a sweep, the internal
+        attenuation is raised by *atten_step_db* and the sweep is
+        repeated, up to *max_overload_retries* times.
 
         Parameters
         ----------
@@ -481,6 +510,10 @@ class RigolRSA3000E(SpectrumAnalyzer):
             Reference level for all measurements.
         settle_s : float
             Settle time after configuring the SA before sweeping.
+        max_overload_retries : int
+            Max times to bump attenuation and re-sweep on overload.
+        atten_step_db : float
+            How much to increase attenuation on each overload retry.
 
         Returns
         -------
@@ -525,7 +558,19 @@ class RigolRSA3000E(SpectrumAnalyzer):
         self.set_reference_level(ref_level_dbm)
         time.sleep(max(settle_s, 0.1))
 
-        wb_freqs, wb_amps = self.read_trace_fresh(trace=1)
+        for attempt in range(max_overload_retries + 1):
+            wb_freqs, wb_amps = self.read_trace_fresh(trace=1)
+            if not self.is_input_overloaded():
+                break
+            current = self.get_input_attenuation()
+            new_atten = current + atten_step_db
+            log.warning(
+                "SA input overload during harmonic sweep (attempt %d/%d). "
+                "Increasing attenuation %g -> %g dB and re-sweeping.",
+                attempt + 1, max_overload_retries, current, new_atten,
+            )
+            self.set_input_attenuation(new_atten)
+            time.sleep(settle_s or 0.15)
 
         point_spacing = span / max(len(wb_amps) - 1, 1)
         half_search = max(per_tone_span_hz / 2.0, point_spacing * 2.0)
