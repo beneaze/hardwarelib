@@ -253,33 +253,39 @@ class RigolRSA3000E(SpectrumAnalyzer):
             "input_atten_db": atten,
         }
 
-    def auto_adjust_attenuation(
+    def auto_adjust_for_overload(
         self,
-        start_atten_db: float = 0.0,
-        step_db: float = 5.0,
-        max_atten_db: float = 40.0,
+        ref_level_step_db: float = 10.0,
+        max_retries: int = 3,
         margin_db: float = 1.0,
         settle_s: float = 0.15,
     ) -> dict:
-        """Increase internal attenuation until the input is no longer clipping.
+        """Raise the reference level until the input is no longer clipping.
 
-        Starting from *start_atten_db*, the method sets the attenuation,
-        triggers a sweep, and checks for clipping.  If the signal is still
-        clipping it increases attenuation by *step_db* and retries, up to
-        *max_atten_db*.
+        Auto-attenuation is enabled first, then sweeps are taken.  If the
+        SA still reports overload or the trace peak is within *margin_db*
+        of the reference level, the reference level is raised by
+        *ref_level_step_db* (the SA auto-increases attenuation to match)
+        and the sweep is repeated.
 
         Returns the same dict as :meth:`check_clipping`, augmented with
         ``"converged"`` (``True`` if clipping was resolved).
         """
-        atten = start_atten_db
-        while atten <= max_atten_db:
-            self.set_input_attenuation(atten)
+        self.set_input_attenuation_auto()
+        for attempt in range(max_retries + 1):
             time.sleep(settle_s)
             self.trigger_single_sweep()
             status = self.check_clipping(margin_db=margin_db)
             if not status["clipping"]:
                 return {**status, "converged": True}
-            atten += step_db
+            current_ref = status["ref_level_dbm"]
+            new_ref = current_ref + ref_level_step_db
+            log.warning(
+                "SA overload (attempt %d/%d). "
+                "Raising reference level %.1f -> %.1f dBm.",
+                attempt + 1, max_retries, current_ref, new_ref,
+            )
+            self.set_reference_level(new_ref)
 
         return {**status, "converged": False}
 
@@ -407,6 +413,7 @@ class RigolRSA3000E(SpectrumAnalyzer):
         ref_level_dbm: float = 10.0,
     ) -> None:
         """One-shot setup for measuring a single tone at *center_hz*."""
+        self.set_input_attenuation_auto()
         self._set_and_verify(
             f":SENSe:FREQuency:CENTer {center_hz:.0f}",
             ":SENSe:FREQuency:CENTer?",
@@ -435,16 +442,18 @@ class RigolRSA3000E(SpectrumAnalyzer):
         ref_level_dbm: float = 10.0,
         settle_s: float = 0.1,
         max_overload_retries: int = 3,
-        atten_step_db: float = 10.0,
+        ref_level_step_db: float = 10.0,
     ) -> Tuple[float, float]:
         """Measure the peak power near *freq_hz*.
 
         Configures center/span, runs a single sweep, does a peak search,
         and returns ``(measured_freq_hz, power_dbm)``.
 
-        If the SA reports an input overload after a sweep, the internal
-        attenuation is raised by *atten_step_db* and the measurement is
-        repeated, up to *max_overload_retries* times.
+        Auto-attenuation is always enabled so the SA couples attenuation
+        to the reference level.  If an overload is still detected after a
+        sweep the reference level is raised by *ref_level_step_db* (which
+        makes the SA auto-increase attenuation) and the sweep is repeated,
+        up to *max_overload_retries* times.
         """
         self.configure_for_single_tone(
             center_hz=freq_hz,
@@ -455,18 +464,19 @@ class RigolRSA3000E(SpectrumAnalyzer):
         if settle_s > 0:
             time.sleep(settle_s)
 
+        current_ref = ref_level_dbm
         for attempt in range(max_overload_retries + 1):
             self.trigger_single_sweep()
             if not self.is_input_overloaded():
                 break
-            current = self.get_input_attenuation()
-            new_atten = current + atten_step_db
+            new_ref = current_ref + ref_level_step_db
             log.warning(
                 "SA input overload detected (attempt %d/%d). "
-                "Increasing attenuation %g -> %g dB and re-sweeping.",
-                attempt + 1, max_overload_retries, current, new_atten,
+                "Raising reference level %.1f -> %.1f dBm and re-sweeping.",
+                attempt + 1, max_overload_retries, current_ref, new_ref,
             )
-            self.set_input_attenuation(new_atten)
+            current_ref = new_ref
+            self.set_reference_level(current_ref)
             time.sleep(settle_s or 0.15)
 
         self.marker_peak_search(marker=1)
@@ -481,7 +491,7 @@ class RigolRSA3000E(SpectrumAnalyzer):
         ref_level_dbm: float = 10.0,
         settle_s: float = 0.1,
         max_overload_retries: int = 3,
-        atten_step_db: float = 10.0,
+        ref_level_step_db: float = 10.0,
     ) -> dict:
         """Measure the fundamental and its harmonics from a wideband sweep.
 
@@ -490,9 +500,11 @@ class RigolRSA3000E(SpectrumAnalyzer):
         data.  Uses :meth:`read_trace_fresh` which retries if the SA
         returns stale data from the previous sweep.
 
-        If the SA reports an input overload after a sweep, the internal
-        attenuation is raised by *atten_step_db* and the sweep is
-        repeated, up to *max_overload_retries* times.
+        Auto-attenuation is always enabled so the SA couples attenuation
+        to the reference level.  If an overload is still detected after a
+        sweep the reference level is raised by *ref_level_step_db* (which
+        makes the SA auto-increase attenuation) and the sweep is repeated,
+        up to *max_overload_retries* times.
 
         Parameters
         ----------
@@ -511,9 +523,9 @@ class RigolRSA3000E(SpectrumAnalyzer):
         settle_s : float
             Settle time after configuring the SA before sweeping.
         max_overload_retries : int
-            Max times to bump attenuation and re-sweep on overload.
-        atten_step_db : float
-            How much to increase attenuation on each overload retry.
+            Max times to raise reference level and re-sweep on overload.
+        ref_level_step_db : float
+            How much to raise the reference level on each overload retry.
 
         Returns
         -------
@@ -526,6 +538,8 @@ class RigolRSA3000E(SpectrumAnalyzer):
         - ``"wideband_trace"`` : ``(frequencies_hz, amplitudes_dbm)``
           covering 0.5f … (n_harmonics + 0.5) × f0
         """
+        self.set_input_attenuation_auto()
+
         wideband_start = max(fundamental_hz * 0.5, 9e3)
         wideband_stop = min((n_harmonics + 0.5) * fundamental_hz, 3.0e9)
 
@@ -555,21 +569,23 @@ class RigolRSA3000E(SpectrumAnalyzer):
         else:
             self.set_rbw_auto()
         self.set_vbw_auto()
-        self.set_reference_level(ref_level_dbm)
+
+        current_ref = ref_level_dbm
+        self.set_reference_level(current_ref)
         time.sleep(max(settle_s, 0.1))
 
         for attempt in range(max_overload_retries + 1):
             wb_freqs, wb_amps = self.read_trace_fresh(trace=1)
             if not self.is_input_overloaded():
                 break
-            current = self.get_input_attenuation()
-            new_atten = current + atten_step_db
+            new_ref = current_ref + ref_level_step_db
             log.warning(
                 "SA input overload during harmonic sweep (attempt %d/%d). "
-                "Increasing attenuation %g -> %g dB and re-sweeping.",
-                attempt + 1, max_overload_retries, current, new_atten,
+                "Raising reference level %.1f -> %.1f dBm and re-sweeping.",
+                attempt + 1, max_overload_retries, current_ref, new_ref,
             )
-            self.set_input_attenuation(new_atten)
+            current_ref = new_ref
+            self.set_reference_level(current_ref)
             time.sleep(settle_s or 0.15)
 
         point_spacing = span / max(len(wb_amps) - 1, 1)

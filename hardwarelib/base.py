@@ -107,6 +107,6 @@ class SpectrumAnalyzer(Instrument):
         ...
 
     @abstractmethod
-    def auto_adjust_attenuation(self, **kwargs) -> dict:
-        """Increase internal attenuation until clipping is resolved."""
+    def auto_adjust_for_overload(self, **kwargs) -> dict:
+        """Raise reference level / attenuation until clipping is resolved."""
         ...
