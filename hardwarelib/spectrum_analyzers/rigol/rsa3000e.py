@@ -246,7 +246,7 @@ class RigolRSA3000E(SpectrumAnalyzer):
         span_hz: float = 1e6,
         rbw_hz: Optional[float] = None,
         ref_level_dbm: float = 10.0,
-        settle_s: float = 0.05,
+        settle_s: float = 0.1,
     ) -> Tuple[float, float]:
         """Measure the peak power near *freq_hz*.
 
@@ -262,6 +262,7 @@ class RigolRSA3000E(SpectrumAnalyzer):
         if settle_s > 0:
             time.sleep(settle_s)
         self.trigger_single_sweep()
+        time.sleep(0.05)
         self.marker_peak_search(marker=1)
         return self.read_marker(marker=1)
 
@@ -272,17 +273,14 @@ class RigolRSA3000E(SpectrumAnalyzer):
         per_tone_span_hz: float = 1e6,
         rbw_hz: Optional[float] = None,
         ref_level_dbm: float = 10.0,
-        settle_s: float = 0.05,
+        settle_s: float = 0.1,
     ) -> dict:
-        """Measure the fundamental and its harmonics individually.
+        """Measure the fundamental and its harmonics from a wideband sweep.
 
-        For each harmonic *k* = 1 … *n_harmonics*, centres the SA on
-        *k* × *fundamental_hz* with a narrow span and reads the peak
-        power.  This gives accurate power readings even when harmonics
-        are far apart and span the full SA bandwidth.
-
-        Also takes one wideband sweep covering all harmonics and returns
-        its trace data for plotting.
+        Takes a wideband sweep covering all harmonics, then extracts the
+        peak power near each expected harmonic frequency from the trace
+        data.  This avoids the race condition of rapidly reconfiguring
+        center/span for each tone individually.
 
         Parameters
         ----------
@@ -292,13 +290,14 @@ class RigolRSA3000E(SpectrumAnalyzer):
             Number of harmonics to measure (including fundamental).
             E.g. 5 → measures f, 2f, 3f, 4f, 5f.
         per_tone_span_hz : float
-            Span for each individual tone measurement.
+            Window around each nominal harmonic within which the peak
+            is searched in the wideband trace data.
         rbw_hz : float, optional
             Resolution bandwidth.  ``None`` → auto.
         ref_level_dbm : float
             Reference level for all measurements.
         settle_s : float
-            Settle time before each measurement.
+            Settle time after configuring the SA before sweeping.
 
         Returns
         -------
@@ -309,27 +308,8 @@ class RigolRSA3000E(SpectrumAnalyzer):
           ``harmonic_number``, ``nominal_freq_hz``,
           ``measured_freq_hz``, ``power_dbm``
         - ``"wideband_trace"`` : ``(frequencies_hz, amplitudes_dbm)``
-          covering 0 … (n_harmonics + 0.5) × f0
+          covering 0.5f … (n_harmonics + 0.5) × f0
         """
-        results = []
-        for k in range(1, n_harmonics + 1):
-            tone_hz = k * fundamental_hz
-            if tone_hz > 3.0e9:
-                break
-            meas_f, meas_p = self.measure_power_at_frequency(
-                freq_hz=tone_hz,
-                span_hz=per_tone_span_hz,
-                rbw_hz=rbw_hz,
-                ref_level_dbm=ref_level_dbm,
-                settle_s=settle_s,
-            )
-            results.append({
-                "harmonic_number": k,
-                "nominal_freq_hz": tone_hz,
-                "measured_freq_hz": meas_f,
-                "power_dbm": meas_p,
-            })
-
         wideband_start = max(fundamental_hz * 0.5, 9e3)
         wideband_stop = min((n_harmonics + 0.5) * fundamental_hz, 3.0e9)
         self.set_start_frequency(wideband_start)
@@ -340,10 +320,33 @@ class RigolRSA3000E(SpectrumAnalyzer):
             self.set_rbw_auto()
         self.set_vbw_auto()
         self.set_reference_level(ref_level_dbm)
-        if settle_s > 0:
-            time.sleep(settle_s)
+        time.sleep(max(settle_s, 0.05))
         self.trigger_single_sweep()
+        time.sleep(0.05)
         wb_freqs, wb_amps = self.read_trace(trace=1)
+
+        half_search = per_tone_span_hz / 2.0
+        results = []
+        for k in range(1, n_harmonics + 1):
+            tone_hz = k * fundamental_hz
+            if tone_hz > 3.0e9:
+                break
+
+            mask = (wb_freqs >= tone_hz - half_search) & (wb_freqs <= tone_hz + half_search)
+            if np.any(mask):
+                idx = np.argmax(wb_amps[mask])
+                peak_freq = float(wb_freqs[mask][idx])
+                peak_power = float(wb_amps[mask][idx])
+            else:
+                peak_freq = tone_hz
+                peak_power = float("nan")
+
+            results.append({
+                "harmonic_number": k,
+                "nominal_freq_hz": tone_hz,
+                "measured_freq_hz": peak_freq,
+                "power_dbm": peak_power,
+            })
 
         return {
             "fundamental_hz": fundamental_hz,
