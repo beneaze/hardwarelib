@@ -100,3 +100,13 @@ class SpectrumAnalyzer(Instrument):
     def read_trace(self, trace: int = 1) -> Tuple[np.ndarray, np.ndarray]:
         """Return ``(frequencies_hz, amplitudes_dbm)`` for the full trace."""
         ...
+
+    @abstractmethod
+    def check_clipping(self, trace: int = 1, margin_db: float = 1.0) -> dict:
+        """Check whether the current measurement is clipping / overloaded."""
+        ...
+
+    @abstractmethod
+    def auto_adjust_attenuation(self, **kwargs) -> dict:
+        """Increase internal attenuation until clipping is resolved."""
+        ...

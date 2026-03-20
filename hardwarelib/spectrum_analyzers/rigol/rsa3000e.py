@@ -190,8 +190,95 @@ class RigolRSA3000E(SpectrumAnalyzer):
         self.write(":SENSe:POWer:RF:ATTenuation:AUTO OFF")
         self.write(f":SENSe:POWer:RF:ATTenuation {atten_db:.0f}")
 
+    def get_input_attenuation(self) -> float:
+        """Return current RF input attenuation in dB."""
+        return float(self.query(":SENSe:POWer:RF:ATTenuation?"))
+
     def set_input_attenuation_auto(self) -> None:
         self.write(":SENSe:POWer:RF:ATTenuation:AUTO ON")
+
+    # -- Clipping / overload detection -----------------------------------------
+
+    def is_input_overloaded(self) -> bool:
+        """Query the questionable-power status register for an overload condition.
+
+        Bit 3 (value 8) of ``:STATus:QUEStionable:CONDition?`` signals an
+        IF / ADC overload on the RSA3000E.  Returns ``True`` when the
+        instrument reports overload.
+        """
+        raw = int(self.query(":STATus:QUEStionable:CONDition?"))
+        return bool(raw & 0x08)
+
+    def check_clipping(
+        self,
+        trace: int = 1,
+        margin_db: float = 1.0,
+    ) -> dict:
+        """Check whether the current measurement is clipping.
+
+        Two independent checks are performed:
+
+        1. **Status register** — the hardware overload flag.
+        2. **Trace proximity** — whether the peak trace amplitude is within
+           *margin_db* of the reference level, which typically indicates the
+           ADC is saturating even if the status bit is not set.
+
+        Returns a dict::
+
+            {
+                "clipping": bool,           # True if either check triggers
+                "status_overload": bool,    # hardware overload flag
+                "trace_near_ref": bool,     # peak within margin of ref level
+                "ref_level_dbm": float,
+                "peak_dbm": float,
+                "input_atten_db": float,
+            }
+        """
+        status_overload = self.is_input_overloaded()
+        ref_level = self.get_reference_level()
+        atten = self.get_input_attenuation()
+        _, amps = self.read_trace(trace)
+        peak_dbm = float(np.max(amps))
+        trace_near_ref = (ref_level - peak_dbm) < margin_db
+
+        return {
+            "clipping": status_overload or trace_near_ref,
+            "status_overload": status_overload,
+            "trace_near_ref": trace_near_ref,
+            "ref_level_dbm": ref_level,
+            "peak_dbm": peak_dbm,
+            "input_atten_db": atten,
+        }
+
+    def auto_adjust_attenuation(
+        self,
+        start_atten_db: float = 0.0,
+        step_db: float = 5.0,
+        max_atten_db: float = 40.0,
+        margin_db: float = 1.0,
+        settle_s: float = 0.15,
+    ) -> dict:
+        """Increase internal attenuation until the input is no longer clipping.
+
+        Starting from *start_atten_db*, the method sets the attenuation,
+        triggers a sweep, and checks for clipping.  If the signal is still
+        clipping it increases attenuation by *step_db* and retries, up to
+        *max_atten_db*.
+
+        Returns the same dict as :meth:`check_clipping`, augmented with
+        ``"converged"`` (``True`` if clipping was resolved).
+        """
+        atten = start_atten_db
+        while atten <= max_atten_db:
+            self.set_input_attenuation(atten)
+            time.sleep(settle_s)
+            self.trigger_single_sweep()
+            status = self.check_clipping(margin_db=margin_db)
+            if not status["clipping"]:
+                return {**status, "converged": True}
+            atten += step_db
+
+        return {**status, "converged": False}
 
     # -- Sweep control ---------------------------------------------------------
 
