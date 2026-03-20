@@ -100,6 +100,37 @@ class RigolRSA3000E(SpectrumAnalyzer):
         finally:
             self._inst.timeout = saved
 
+    # -- Write-then-verify helper ----------------------------------------------
+
+    def _set_and_verify(
+        self,
+        write_cmd: str,
+        query_cmd: str,
+        value: float,
+        tol_frac: float = 0.01,
+        retries: int = 3,
+        delay: float = 0.15,
+    ) -> float:
+        """Write a numeric parameter and read it back to confirm it took effect.
+
+        Retries up to *retries* times with *delay* seconds between attempts.
+        Returns the value as read back from the instrument.
+        Raises ``RuntimeError`` if the value still doesn't match after all retries.
+        """
+        for attempt in range(retries):
+            self.write(write_cmd)
+            time.sleep(delay)
+            readback = float(self.query(query_cmd))
+            if value == 0:
+                if readback == 0:
+                    return readback
+            elif abs(readback - value) / abs(value) <= tol_frac:
+                return readback
+        raise RuntimeError(
+            f"SA did not accept setting after {retries} attempts: "
+            f"sent {write_cmd!r}, expected {value}, got {readback}"
+        )
+
     # -- SpectrumAnalyzer interface --------------------------------------------
 
     def idn(self) -> str:
@@ -120,8 +151,14 @@ class RigolRSA3000E(SpectrumAnalyzer):
     def set_start_frequency(self, freq_hz: float) -> None:
         self.write(f":SENSe:FREQuency:STARt {freq_hz:.0f}")
 
+    def get_start_frequency(self) -> float:
+        return float(self.query(":SENSe:FREQuency:STARt?"))
+
     def set_stop_frequency(self, freq_hz: float) -> None:
         self.write(f":SENSe:FREQuency:STOP {freq_hz:.0f}")
+
+    def get_stop_frequency(self) -> float:
+        return float(self.query(":SENSe:FREQuency:STOP?"))
 
     def set_rbw(self, rbw_hz: float) -> None:
         self.write(":SENSe:BANDwidth:RESolution:AUTO OFF")
@@ -280,8 +317,16 @@ class RigolRSA3000E(SpectrumAnalyzer):
         ref_level_dbm: float = 10.0,
     ) -> None:
         """One-shot setup for measuring a single tone at *center_hz*."""
-        self.set_center_frequency(center_hz)
-        self.set_span(span_hz)
+        self._set_and_verify(
+            f":SENSe:FREQuency:CENTer {center_hz:.0f}",
+            ":SENSe:FREQuency:CENTer?",
+            center_hz,
+        )
+        self._set_and_verify(
+            f":SENSe:FREQuency:SPAN {span_hz:.0f}",
+            ":SENSe:FREQuency:SPAN?",
+            span_hz,
+        )
         if rbw_hz is not None:
             self.set_rbw(rbw_hz)
         else:
@@ -363,13 +408,26 @@ class RigolRSA3000E(SpectrumAnalyzer):
         """
         wideband_start = max(fundamental_hz * 0.5, 9e3)
         wideband_stop = min((n_harmonics + 0.5) * fundamental_hz, 3.0e9)
-        self.set_start_frequency(wideband_start)
-        self.set_stop_frequency(wideband_stop)
+
+        self._set_and_verify(
+            f":SENSe:FREQuency:STARt {wideband_start:.0f}",
+            ":SENSe:FREQuency:STARt?",
+            wideband_start,
+        )
+        self._set_and_verify(
+            f":SENSe:FREQuency:STOP {wideband_stop:.0f}",
+            ":SENSe:FREQuency:STOP?",
+            wideband_stop,
+        )
 
         span = wideband_stop - wideband_start
         min_points = max(int(span / (per_tone_span_hz * 0.25)) + 1, 801)
         min_points = min(min_points, 10001)
-        self.set_sweep_points(min_points)
+        self._set_and_verify(
+            f":SENSe:SWEep:POINts {min_points}",
+            ":SENSe:SWEep:POINts?",
+            min_points,
+        )
         self.set_sweep_time_auto()
 
         if rbw_hz is not None:
