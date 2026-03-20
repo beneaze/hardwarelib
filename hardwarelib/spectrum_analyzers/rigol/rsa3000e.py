@@ -155,7 +155,9 @@ class RigolRSA3000E(SpectrumAnalyzer):
         self.write(f":INITiate:CONTinuous {'ON' if enabled else 'OFF'}")
 
     def trigger_single_sweep(self, timeout_s: float = 10.0) -> None:
-        self.set_continuous_sweep(False)
+        self.write(":INITiate:CONTinuous OFF")
+        self.write(":ABORt")
+        time.sleep(0.05)
         self.write(":INITiate:IMMediate")
         self._opc_wait(timeout_s=timeout_s)
 
@@ -314,6 +316,12 @@ class RigolRSA3000E(SpectrumAnalyzer):
         wideband_stop = min((n_harmonics + 0.5) * fundamental_hz, 3.0e9)
         self.set_start_frequency(wideband_start)
         self.set_stop_frequency(wideband_stop)
+
+        span = wideband_stop - wideband_start
+        min_points = max(int(span / (per_tone_span_hz * 0.25)) + 1, 801)
+        min_points = min(min_points, 10001)
+        self.set_sweep_points(min_points)
+
         if rbw_hz is not None:
             self.set_rbw(rbw_hz)
         else:
@@ -325,7 +333,8 @@ class RigolRSA3000E(SpectrumAnalyzer):
         time.sleep(0.05)
         wb_freqs, wb_amps = self.read_trace(trace=1)
 
-        half_search = per_tone_span_hz / 2.0
+        point_spacing = span / max(len(wb_amps) - 1, 1)
+        half_search = max(per_tone_span_hz / 2.0, point_spacing * 2.0)
         results = []
         for k in range(1, n_harmonics + 1):
             tone_hz = k * fundamental_hz
