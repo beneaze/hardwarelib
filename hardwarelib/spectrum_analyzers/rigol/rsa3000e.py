@@ -1,0 +1,352 @@
+"""Driver for Rigol RSA3000E-series real-time spectrum analyzers over VISA (SCPI).
+
+Tested on the RSA3030E (9 kHz – 3 GHz).  Should work with other RSA3000E
+variants (RSA3015E, -TG models) without modification.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Optional, Tuple
+
+import numpy as np
+import pyvisa
+
+from hardwarelib.base import SpectrumAnalyzer
+
+
+class RigolRSA3000E(SpectrumAnalyzer):
+    """VISA driver for the Rigol RSA3000E spectrum analyzer family.
+
+    Operates in GPSA (General Purpose Spectrum Analyzer) mode.
+
+    Parameters
+    ----------
+    resource_name : str
+        VISA resource string, e.g.
+        ``"USB0::0x1AB1::0x0960::RSA3E243900001::INSTR"`` or
+        ``"TCPIP0::192.168.1.51::INSTR"``.
+    timeout_ms : int
+        VISA I/O timeout in milliseconds.
+    """
+
+    def __init__(self, resource_name: str, timeout_ms: int = 30_000):
+        self.resource_name = resource_name
+        self.timeout_ms = timeout_ms
+        self._rm: Optional[pyvisa.ResourceManager] = None
+        self._inst = None
+
+    # -- Instrument lifecycle --------------------------------------------------
+
+    def open(self) -> None:
+        self._rm = pyvisa.ResourceManager()
+        self._inst = self._rm.open_resource(self.resource_name)
+        self._inst.timeout = self.timeout_ms
+        self._inst.write_termination = "\n"
+        self._inst.read_termination = "\n"
+
+    def close(self) -> None:
+        try:
+            if self._inst is not None:
+                self._inst.close()
+        finally:
+            self._inst = None
+            if self._rm is not None:
+                self._rm.close()
+                self._rm = None
+
+    # -- Low-level SCPI helpers ------------------------------------------------
+
+    def write(self, cmd: str) -> None:
+        if self._inst is None:
+            raise RuntimeError("Spectrum analyzer not open.")
+        self._inst.write(cmd)
+
+    def query(self, cmd: str) -> str:
+        if self._inst is None:
+            raise RuntimeError("Spectrum analyzer not open.")
+        return self._inst.query(cmd).strip()
+
+    def flush(self) -> None:
+        if self._inst is None:
+            return
+        try:
+            self._inst.clear()
+        except Exception:
+            pass
+        try:
+            self.write("*CLS")
+        except Exception:
+            pass
+
+    def reset(self) -> None:
+        self.write("*RST")
+        self.write("*CLS")
+        self._opc_wait(timeout_s=10.0)
+
+    def _opc_wait(self, timeout_s: float = 10.0) -> None:
+        """Block until all pending operations complete (``*OPC?``)."""
+        saved = self._inst.timeout
+        self._inst.timeout = int(timeout_s * 1000)
+        try:
+            self.query("*OPC?")
+        finally:
+            self._inst.timeout = saved
+
+    # -- SpectrumAnalyzer interface --------------------------------------------
+
+    def idn(self) -> str:
+        return self.query("*IDN?")
+
+    def set_center_frequency(self, freq_hz: float) -> None:
+        self.write(f":SENSe:FREQuency:CENTer {freq_hz:.0f}")
+
+    def get_center_frequency(self) -> float:
+        return float(self.query(":SENSe:FREQuency:CENTer?"))
+
+    def set_span(self, span_hz: float) -> None:
+        self.write(f":SENSe:FREQuency:SPAN {span_hz:.0f}")
+
+    def get_span(self) -> float:
+        return float(self.query(":SENSe:FREQuency:SPAN?"))
+
+    def set_start_frequency(self, freq_hz: float) -> None:
+        self.write(f":SENSe:FREQuency:STARt {freq_hz:.0f}")
+
+    def set_stop_frequency(self, freq_hz: float) -> None:
+        self.write(f":SENSe:FREQuency:STOP {freq_hz:.0f}")
+
+    def set_rbw(self, rbw_hz: float) -> None:
+        self.write(":SENSe:BANDwidth:RESolution:AUTO OFF")
+        self.write(f":SENSe:BANDwidth:RESolution {rbw_hz:.0f}")
+
+    def get_rbw(self) -> float:
+        return float(self.query(":SENSe:BANDwidth:RESolution?"))
+
+    def set_rbw_auto(self) -> None:
+        self.write(":SENSe:BANDwidth:RESolution:AUTO ON")
+
+    def set_vbw(self, vbw_hz: float) -> None:
+        self.write(":SENSe:BANDwidth:VIDeo:AUTO OFF")
+        self.write(f":SENSe:BANDwidth:VIDeo {vbw_hz:.0f}")
+
+    def get_vbw(self) -> float:
+        return float(self.query(":SENSe:BANDwidth:VIDeo?"))
+
+    def set_vbw_auto(self) -> None:
+        self.write(":SENSe:BANDwidth:VIDeo:AUTO ON")
+
+    def set_reference_level(self, level_dbm: float) -> None:
+        self.write(f":DISPlay:WINDow:TRACe:Y:SCALe:RLEVel {level_dbm:.1f}")
+
+    def get_reference_level(self) -> float:
+        return float(self.query(":DISPlay:WINDow:TRACe:Y:SCALe:RLEVel?"))
+
+    def set_input_attenuation(self, atten_db: float) -> None:
+        self.write(":SENSe:POWer:RF:ATTenuation:AUTO OFF")
+        self.write(f":SENSe:POWer:RF:ATTenuation {atten_db:.0f}")
+
+    def set_input_attenuation_auto(self) -> None:
+        self.write(":SENSe:POWer:RF:ATTenuation:AUTO ON")
+
+    # -- Sweep control ---------------------------------------------------------
+
+    def set_continuous_sweep(self, enabled: bool) -> None:
+        self.write(f":INITiate:CONTinuous {'ON' if enabled else 'OFF'}")
+
+    def trigger_single_sweep(self, timeout_s: float = 10.0) -> None:
+        self.set_continuous_sweep(False)
+        self.write(":INITiate:IMMediate")
+        self._opc_wait(timeout_s=timeout_s)
+
+    def set_sweep_points(self, n_points: int) -> None:
+        self.write(f":SENSe:SWEep:POINts {n_points}")
+
+    def get_sweep_points(self) -> int:
+        return int(float(self.query(":SENSe:SWEep:POINts?")))
+
+    def set_sweep_time(self, time_s: float) -> None:
+        self.write(":SENSe:SWEep:TIME:AUTO OFF")
+        self.write(f":SENSe:SWEep:TIME {time_s:.6f}")
+
+    def set_sweep_time_auto(self) -> None:
+        self.write(":SENSe:SWEep:TIME:AUTO ON")
+
+    # -- Trace control ---------------------------------------------------------
+
+    def set_trace_mode(self, trace: int = 1, mode: str = "WRITe") -> None:
+        """Set trace mode: ``WRITe``, ``MAXHold``, ``MINHold``, ``VIEW``, ``BLANk``, ``AVERage``."""
+        self.write(f":TRACe{trace}:MODE {mode}")
+
+    def set_trace_average_count(self, count: int) -> None:
+        self.write(f":SENSe:AVERage:COUNt {count}")
+
+    # -- Marker operations -----------------------------------------------------
+
+    def set_marker_state(self, marker: int = 1, enabled: bool = True) -> None:
+        self.write(f":CALCulate:MARKer{marker}:STATe {'ON' if enabled else 'OFF'}")
+
+    def set_marker_frequency(self, freq_hz: float, marker: int = 1) -> None:
+        self.set_marker_state(marker, True)
+        self.write(f":CALCulate:MARKer{marker}:X {freq_hz:.0f}")
+
+    def marker_peak_search(self, marker: int = 1) -> None:
+        self.set_marker_state(marker, True)
+        self.write(f":CALCulate:MARKer{marker}:MAXimum")
+
+    def marker_next_peak(self, marker: int = 1) -> None:
+        self.write(f":CALCulate:MARKer{marker}:MAXimum:NEXT")
+
+    def read_marker(self, marker: int = 1) -> Tuple[float, float]:
+        freq_hz = float(self.query(f":CALCulate:MARKer{marker}:X?"))
+        amp_dbm = float(self.query(f":CALCulate:MARKer{marker}:Y?"))
+        return freq_hz, amp_dbm
+
+    # -- Trace data readout ----------------------------------------------------
+
+    def read_trace(self, trace: int = 1) -> Tuple[np.ndarray, np.ndarray]:
+        start = float(self.query(":SENSe:FREQuency:STARt?"))
+        stop = float(self.query(":SENSe:FREQuency:STOP?"))
+
+        raw = self.query(f":TRACe:DATA? TRACE{trace}")
+        amplitudes = np.array([float(x) for x in raw.split(",")], dtype=np.float64)
+        frequencies = np.linspace(start, stop, len(amplitudes))
+        return frequencies, amplitudes
+
+    # -- Convenience -----------------------------------------------------------
+
+    def configure_for_single_tone(
+        self,
+        center_hz: float,
+        span_hz: float = 1e6,
+        rbw_hz: Optional[float] = None,
+        vbw_hz: Optional[float] = None,
+        ref_level_dbm: float = 10.0,
+    ) -> None:
+        """One-shot setup for measuring a single tone at *center_hz*.
+
+        Sets center / span, optionally RBW / VBW, reference level,
+        then runs a single sweep so the marker can be placed.
+        """
+        self.set_center_frequency(center_hz)
+        self.set_span(span_hz)
+        if rbw_hz is not None:
+            self.set_rbw(rbw_hz)
+        else:
+            self.set_rbw_auto()
+        if vbw_hz is not None:
+            self.set_vbw(vbw_hz)
+        else:
+            self.set_vbw_auto()
+        self.set_reference_level(ref_level_dbm)
+
+    def measure_power_at_frequency(
+        self,
+        freq_hz: float,
+        span_hz: float = 1e6,
+        rbw_hz: Optional[float] = None,
+        ref_level_dbm: float = 10.0,
+        settle_s: float = 0.05,
+    ) -> Tuple[float, float]:
+        """Measure the peak power near *freq_hz*.
+
+        Configures center/span, runs a single sweep, does a peak search,
+        and returns ``(measured_freq_hz, power_dbm)``.
+        """
+        self.configure_for_single_tone(
+            center_hz=freq_hz,
+            span_hz=span_hz,
+            rbw_hz=rbw_hz,
+            ref_level_dbm=ref_level_dbm,
+        )
+        if settle_s > 0:
+            time.sleep(settle_s)
+        self.trigger_single_sweep()
+        self.marker_peak_search(marker=1)
+        return self.read_marker(marker=1)
+
+    def measure_harmonics(
+        self,
+        fundamental_hz: float,
+        n_harmonics: int = 5,
+        per_tone_span_hz: float = 1e6,
+        rbw_hz: Optional[float] = None,
+        ref_level_dbm: float = 10.0,
+        settle_s: float = 0.05,
+    ) -> dict:
+        """Measure the fundamental and its harmonics individually.
+
+        For each harmonic *k* = 1 … *n_harmonics*, centres the SA on
+        *k* × *fundamental_hz* with a narrow span and reads the peak
+        power.  This gives accurate power readings even when harmonics
+        are far apart and span the full SA bandwidth.
+
+        Also takes one wideband sweep covering all harmonics and returns
+        its trace data for plotting.
+
+        Parameters
+        ----------
+        fundamental_hz : float
+            Fundamental frequency.
+        n_harmonics : int
+            Number of harmonics to measure (including fundamental).
+            E.g. 5 → measures f, 2f, 3f, 4f, 5f.
+        per_tone_span_hz : float
+            Span for each individual tone measurement.
+        rbw_hz : float, optional
+            Resolution bandwidth.  ``None`` → auto.
+        ref_level_dbm : float
+            Reference level for all measurements.
+        settle_s : float
+            Settle time before each measurement.
+
+        Returns
+        -------
+        dict with keys:
+
+        - ``"fundamental_hz"`` : float
+        - ``"harmonics"`` : list of dicts, each with
+          ``harmonic_number``, ``nominal_freq_hz``,
+          ``measured_freq_hz``, ``power_dbm``
+        - ``"wideband_trace"`` : ``(frequencies_hz, amplitudes_dbm)``
+          covering 0 … (n_harmonics + 0.5) × f0
+        """
+        results = []
+        for k in range(1, n_harmonics + 1):
+            tone_hz = k * fundamental_hz
+            if tone_hz > 3.0e9:
+                break
+            meas_f, meas_p = self.measure_power_at_frequency(
+                freq_hz=tone_hz,
+                span_hz=per_tone_span_hz,
+                rbw_hz=rbw_hz,
+                ref_level_dbm=ref_level_dbm,
+                settle_s=settle_s,
+            )
+            results.append({
+                "harmonic_number": k,
+                "nominal_freq_hz": tone_hz,
+                "measured_freq_hz": meas_f,
+                "power_dbm": meas_p,
+            })
+
+        wideband_start = max(fundamental_hz * 0.5, 9e3)
+        wideband_stop = min((n_harmonics + 0.5) * fundamental_hz, 3.0e9)
+        self.set_start_frequency(wideband_start)
+        self.set_stop_frequency(wideband_stop)
+        if rbw_hz is not None:
+            self.set_rbw(rbw_hz)
+        else:
+            self.set_rbw_auto()
+        self.set_vbw_auto()
+        self.set_reference_level(ref_level_dbm)
+        if settle_s > 0:
+            time.sleep(settle_s)
+        self.trigger_single_sweep()
+        wb_freqs, wb_amps = self.read_trace(trace=1)
+
+        return {
+            "fundamental_hz": fundamental_hz,
+            "harmonics": results,
+            "wideband_trace": (wb_freqs, wb_amps),
+        }
