@@ -124,6 +124,31 @@ class RigolDHO4000(Oscilloscope):
     def set_trigger_mode(self, mode: str = "AUTO") -> None:
         self.write(f":TRIGger:SWEep {mode}")
 
+    # -- Memory depth ----------------------------------------------------------
+
+    def get_memory_depth(self) -> str:
+        """Return the current acquisition memory depth setting."""
+        return self.query(":ACQuire:MDEPth?")
+
+    def set_memory_depth(self, depth: int | str) -> None:
+        """Set acquisition memory depth (int for fixed, ``"AUTO"`` for auto)."""
+        self.write(f":ACQuire:MDEPth {depth}")
+
+    # -- Fast waveform readout -------------------------------------------------
+
+    def prepare_for_readout(self, channel: int) -> None:
+        """One-time SCPI setup for repeated reads on the same channel.
+
+        Call once before a sweep loop, then use :meth:`read_waveform`
+        which will skip the redundant channel/mode/format commands.
+        """
+        if channel not in (1, 2, 3, 4):
+            raise ValueError("Scope channel must be 1..4")
+        self.write(f":WAVeform:SOURce CHANnel{channel}")
+        self.write(":WAVeform:MODE RAW")
+        self.write(":WAVeform:FORMat BYTE")
+        self._readout_channel = channel
+
     def read_waveform(
         self, channel: int
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
@@ -131,9 +156,11 @@ class RigolDHO4000(Oscilloscope):
             raise ValueError("Scope channel must be 1..4")
 
         self.write(":STOP")
-        self.write(f":WAVeform:SOURce CHANnel{channel}")
-        self.write(":WAVeform:MODE RAW")
-        self.write(":WAVeform:FORMat BYTE")
+
+        if getattr(self, "_readout_channel", None) != channel:
+            self.write(f":WAVeform:SOURce CHANnel{channel}")
+            self.write(":WAVeform:MODE RAW")
+            self.write(":WAVeform:FORMat BYTE")
 
         points = int(float(self.query(":WAVeform:POINts?")))
         self.write(":WAVeform:STARt 1")
