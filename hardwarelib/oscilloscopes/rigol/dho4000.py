@@ -44,11 +44,15 @@ class RigolDHO4000(Oscilloscope):
         self.timeout_ms = timeout_ms
         self._rm: Optional[pyvisa.ResourceManager] = None
         self._inst = None
+        self._readout_channel: Optional[int] = None
+        self._cached_preamble: Optional[list] = None
+        self._cached_points: Optional[int] = None
 
     def open(self) -> None:
         self._rm = pyvisa.ResourceManager()
         self._inst = self._rm.open_resource(self.resource_name)
         self._inst.timeout = self.timeout_ms
+        self._inst.chunk_size = 1_024_000
         self._inst.write_termination = "\n"
         self._inst.read_termination = "\n"
 
@@ -120,6 +124,8 @@ class RigolDHO4000(Oscilloscope):
 
     def set_timebase(self, scale_s_per_div: float) -> None:
         self.write(f":TIMebase:MAIN:SCALe {scale_s_per_div:.6E}")
+        self._cached_preamble = None
+        self._cached_points = None
 
     def set_trigger_mode(self, mode: str = "AUTO") -> None:
         self.write(f":TRIGger:SWEep {mode}")
@@ -133,6 +139,8 @@ class RigolDHO4000(Oscilloscope):
     def set_memory_depth(self, depth: int | str) -> None:
         """Set acquisition memory depth (int for fixed, ``"AUTO"`` for auto)."""
         self.write(f":ACQuire:MDEPth {depth}")
+        self._cached_preamble = None
+        self._cached_points = None
 
     # -- Fast waveform readout -------------------------------------------------
 
@@ -141,6 +149,8 @@ class RigolDHO4000(Oscilloscope):
 
         Call once before a sweep loop, then use :meth:`read_waveform`
         which will skip the redundant channel/mode/format commands.
+        Also pre-caches the preamble and point count so that subsequent
+        reads only need a single ``:WAVeform:DATA?`` transfer.
         """
         if channel not in (1, 2, 3, 4):
             raise ValueError("Scope channel must be 1..4")
@@ -149,19 +159,10 @@ class RigolDHO4000(Oscilloscope):
         self.write(":WAVeform:FORMat BYTE")
         self._readout_channel = channel
 
-    def read_waveform(
-        self, channel: int
-    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
-        if channel not in (1, 2, 3, 4):
-            raise ValueError("Scope channel must be 1..4")
+        self._cache_waveform_metadata()
 
-        self.write(":STOP")
-
-        if getattr(self, "_readout_channel", None) != channel:
-            self.write(f":WAVeform:SOURce CHANnel{channel}")
-            self.write(":WAVeform:MODE RAW")
-            self.write(":WAVeform:FORMat BYTE")
-
+    def _cache_waveform_metadata(self) -> None:
+        """Query and cache the point count and preamble for fast repeated reads."""
         points = int(float(self.query(":WAVeform:POINts?")))
         self.write(":WAVeform:STARt 1")
         self.write(f":WAVeform:STOP {points}")
@@ -170,6 +171,42 @@ class RigolDHO4000(Oscilloscope):
         vals = [float(x) for x in pre.split(",")]
         if len(vals) != 10:
             raise ValueError(f"Unexpected preamble: {pre}")
+
+        self._cached_points = points
+        self._cached_preamble = vals
+
+    def invalidate_cache(self) -> None:
+        """Force the next :meth:`read_waveform` to re-query metadata."""
+        self._cached_preamble = None
+        self._cached_points = None
+
+    def read_waveform(
+        self, channel: int, skip_stop: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+        if channel not in (1, 2, 3, 4):
+            raise ValueError("Scope channel must be 1..4")
+
+        if not skip_stop:
+            self.write(":STOP")
+
+        if self._readout_channel != channel:
+            self.write(f":WAVeform:SOURce CHANnel{channel}")
+            self.write(":WAVeform:MODE RAW")
+            self.write(":WAVeform:FORMat BYTE")
+            self._readout_channel = channel
+            self._cached_preamble = None
+
+        if self._cached_preamble is not None:
+            vals = self._cached_preamble
+        else:
+            points = int(float(self.query(":WAVeform:POINts?")))
+            self.write(":WAVeform:STARt 1")
+            self.write(f":WAVeform:STOP {points}")
+
+            pre = self.query(":WAVeform:PREamble?")
+            vals = [float(x) for x in pre.split(",")]
+            if len(vals) != 10:
+                raise ValueError(f"Unexpected preamble: {pre}")
 
         (
             fmt,
@@ -183,6 +220,51 @@ class RigolDHO4000(Oscilloscope):
             yorigin,
             yreference,
         ) = vals
+
+        raw = self.query_binary_block(":WAVeform:DATA?")
+        adc = np.frombuffer(raw, dtype=np.uint8).astype(np.float64)
+        y_v = (adc - yorigin - yreference) * yincrement
+        t_s = xorigin + (np.arange(adc.size) - xreference) * xincrement
+
+        meta = {
+            "format": fmt,
+            "type": dtype_mode,
+            "points": points_from_pre,
+            "count": count,
+            "xincrement": xincrement,
+            "xorigin": xorigin,
+            "xreference": xreference,
+            "yincrement": yincrement,
+            "yorigin": yorigin,
+            "yreference": yreference,
+        }
+        return t_s, y_v, meta
+
+    def read_waveform_fast(self) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+        """Minimal-latency waveform read using cached metadata.
+
+        Requires a prior call to :meth:`prepare_for_readout`.  Skips the
+        ``:STOP`` command (caller must ensure the scope is already stopped,
+        e.g. after :meth:`acquire_single_and_wait`), and reuses the cached
+        preamble so that only a single ``:WAVeform:DATA?`` transfer is needed.
+        """
+        if self._cached_preamble is None:
+            raise RuntimeError(
+                "No cached preamble — call prepare_for_readout() first."
+            )
+
+        (
+            fmt,
+            dtype_mode,
+            points_from_pre,
+            count,
+            xincrement,
+            xorigin,
+            xreference,
+            yincrement,
+            yorigin,
+            yreference,
+        ) = self._cached_preamble
 
         raw = self.query_binary_block(":WAVeform:DATA?")
         adc = np.frombuffer(raw, dtype=np.uint8).astype(np.float64)
